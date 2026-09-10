@@ -32,7 +32,7 @@ app.get('/test-email', async (req, res) => {
   const to = req.query.to || 'atlasvaultfinance@gmail.com';
   try {
     const response = await axios.post('https://api.resend.com/emails', {
-      from: 'AtlasVault Finance <onboarding@resend.dev>',
+      from: 'AtlasVault Finance <noreply@atlasvault.name.ng>',
       to,
       subject: '✅ AtlasVault Finance — Email Test',
       html: '<h2 style="color:#0A1628">✅ Email is working!</h2><p>AtlasVault Finance emails are live!</p>'
