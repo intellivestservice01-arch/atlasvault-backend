@@ -10,7 +10,10 @@ const { generateCode, generateReferenceId } = require('../utils/helpers');
 const { upload, uploadToSupabase } = require('../config/storage');
 require('dotenv').config();
 
-// LOGIN
+// Admin 2FA OTP store (in-memory)
+const adminOTPs = {};
+
+// LOGIN STEP 1 — verify username/password → send OTP
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -18,9 +21,53 @@ router.post('/login', async (req, res) => {
     if (!r.rows[0]) return res.status(401).json({ error: 'Invalid credentials' });
     const valid = await bcrypt.compare(password, r.rows[0].password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    // Generate 5-digit OTP
+    const otp = Math.floor(10000 + Math.random() * 90000).toString();
+    adminOTPs[username] = { otp, expires: Date.now() + 10 * 60 * 1000 };
+    // Send OTP email
+    const axios = require('axios');
+    await axios.post('https://api.resend.com/emails', {
+      from: 'AtlasVault Finance <noreply@atlasvault.name.ng>',
+      to: process.env.ADMIN_EMAIL || 'atlassvault@gmail.com',
+      subject: '🔐 AtlasVault Admin Login Code',
+      html: `<div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto;background:#050E1A;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#050E1A,#0A2540);padding:24px;text-align:center">
+          <h2 style="color:#00D4AA;margin:0;font-size:1.3rem">🏦 AtlasVault Finance</h2>
+          <p style="color:rgba(255,255,255,.5);font-size:.8rem;margin:4px 0 0">Admin Security Code</p>
+        </div>
+        <div style="padding:28px;text-align:center">
+          <p style="color:#E8F4FF;font-size:.9rem;margin-bottom:20px">Your admin login verification code is:</p>
+          <div style="background:#0A2540;border:2px solid #00D4AA;border-radius:10px;padding:20px;font-size:2.5rem;font-weight:bold;color:#00D4AA;letter-spacing:10px;margin:0 auto 20px">${otp}</div>
+          <p style="color:rgba(255,255,255,.4);font-size:.78rem">This code expires in <strong style="color:#00D4AA">10 minutes</strong>.</p>
+          <p style="color:rgba(255,255,255,.4);font-size:.78rem">If you did not attempt to login, secure your account immediately.</p>
+        </div>
+      </div>`
+    }, { headers: { 'Authorization': `Bearer ${process.env.RESEND_API_KEY}`, 'Content-Type': 'application/json' } });
+    console.log(`✅ Admin OTP sent to ${process.env.ADMIN_EMAIL || 'atlassvault@gmail.com'}`);
+    res.json({ message: 'Code sent to admin email. Please enter the 5-digit code.', requires2FA: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Login failed' }); }
+});
+
+// LOGIN STEP 2 — verify OTP → return token
+router.post('/verify-2fa', async (req, res) => {
+  try {
+    const { username, password, otp } = req.body;
+    // Verify stored OTP
+    const stored = adminOTPs[username];
+    if (!stored) return res.status(401).json({ error: 'No code found. Please login again.' });
+    if (Date.now() > stored.expires) { delete adminOTPs[username]; return res.status(401).json({ error: 'Code expired. Please login again.' }); }
+    if (stored.otp !== otp) return res.status(401).json({ error: 'Invalid code. Please try again.' });
+    // Verify credentials again for security
+    const r = await pool.query('SELECT * FROM admin_users WHERE username=$1', [username]);
+    if (!r.rows[0]) return res.status(401).json({ error: 'Invalid credentials' });
+    const valid = await bcrypt.compare(password, r.rows[0].password_hash);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+    // All good — issue token
+    delete adminOTPs[username];
     const token = jwt.sign({ id: r.rows[0].id }, process.env.JWT_ADMIN_SECRET, { expiresIn: '7d' });
+    await require('../config/ntfy').send('🔐 Admin Login', `Admin logged in successfully at ${new Date().toLocaleString()}`, 'high');
     res.json({ message: 'Login successful', token, admin: { id: r.rows[0].id, username: r.rows[0].username } });
-  } catch (e) { res.status(500).json({ error: 'Login failed' }); }
+  } catch (e) { console.error(e); res.status(500).json({ error: 'Verification failed' }); }
 });
 
 // DASHBOARD
