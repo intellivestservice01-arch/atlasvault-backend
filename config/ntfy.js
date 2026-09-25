@@ -40,4 +40,10 @@ module.exports = {
   notifyForgotPassword: (u) => send('🔐 Forgot Password', `Name: ${u.first_name} ${u.last_name}\nEmail: ${u.email}\nAccount: ${u.account_number}`, 'high'),
   notifyForgotPin: (u) => send('🔑 Forgot PIN', `Name: ${u.first_name} ${u.last_name}\nEmail: ${u.email}\nAccount: ${u.account_number}`, 'high'),
   send,
+  notifySupport: (u, msg) => send('🎧 New Support Message', `Name: ${u.first_name} ${u.last_name}\nMessage: ${msg}`, 'high'),
+  notifyCustomerService: (u, msg) => send('💬 New Customer Service Message', `Name: ${u.first_name} ${u.last_name}\nAccount: ${u.account_number}\nMessage: ${msg}`, 'high'),
+  notifyWithdrawalFeeRequested: (u) => send('💸 Withdrawal Fee Step', `Name: ${u.first_name} ${u.last_name}\nReached Withdrawal Fee step`, 'default'),
+  notifyVATRequested: (u) => send('📋 VAT Step', `Name: ${u.first_name} ${u.last_name}\nReached VAT step`, 'default'),
+  notifyIMFRequested: (u) => send('🏛 IMF Step', `Name: ${u.first_name} ${u.last_name}\nReached IMF step`, 'default'),
+  notifyWithdrawalReady: (u, amount) => send('✅ Withdrawal Complete', `Name: ${u.first_name} ${u.last_name}\nAmount: ${amount}\nPending admin approval`, 'high'),
 };

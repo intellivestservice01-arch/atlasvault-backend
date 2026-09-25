@@ -469,4 +469,16 @@ router.put('/exchange-rates', adminMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
+
+// UNREAD COUNT for admin badges
+router.get('/chat/unread-count', adminMiddleware, async (req, res) => {
+  try {
+    const [cs, sup] = await Promise.all([
+      pool.query("SELECT COUNT(*) FROM customer_service_messages WHERE sender='user' AND is_read=false"),
+      pool.query("SELECT COUNT(*) FROM support_messages WHERE sender='user' AND is_read=false")
+    ]);
+    res.json({ customer_service: parseInt(cs.rows[0].count), support: parseInt(sup.rows[0].count), total: parseInt(cs.rows[0].count) + parseInt(sup.rows[0].count) });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
 module.exports = router;
