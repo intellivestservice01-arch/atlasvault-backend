@@ -390,3 +390,89 @@ router.get('/settings/exchange-rates', async (req, res) => {
 });
 
 module.exports = router;
+
+// ============ TRADING / INVESTMENTS ============
+
+// Get all assets
+router.get('/trading/assets', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM trading_assets WHERE is_active=true ORDER BY category,name');
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// Get user portfolio
+router.get('/trading/portfolio', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT t.*, a.icon, a.color, a.category,
+        CASE WHEN t.admin_pnl_override IS NOT NULL AND t.admin_pnl_set_at IS NOT NULL
+          AND NOW() > t.created_at + INTERVAL '2 days'
+          THEN t.admin_pnl_override
+          ELSE CASE WHEN NOW() < t.created_at + INTERVAL '2 days' THEN 0 ELSE t.pnl END
+        END as display_pnl
+      FROM user_trades t JOIN trading_assets a ON t.asset_id=a.id
+      WHERE t.user_id=$1 AND t.status='active'
+      ORDER BY t.created_at DESC
+    `, [req.user.id]);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// Buy asset
+router.post('/trading/buy', authMiddleware, async (req, res) => {
+  try {
+    const { asset_id, amount } = req.body;
+    if (!asset_id || !amount || parseFloat(amount) <= 0) return res.status(400).json({ error: 'Invalid input' });
+    if (parseFloat(amount) > parseFloat(req.user.balance || 0)) return res.status(400).json({ error: 'Insufficient balance' });
+    const asset = await pool.query('SELECT * FROM trading_assets WHERE id=$1', [asset_id]);
+    if (!asset.rows[0]) return res.status(404).json({ error: 'Asset not found' });
+    const a = asset.rows[0];
+    const qty = parseFloat(amount) / parseFloat(a.current_price);
+    const refId = require('../utils/helpers').generateReferenceId();
+    const trade = await pool.query(
+      `INSERT INTO user_trades(user_id,asset_id,asset_symbol,asset_name,type,quantity,buy_price,current_price,amount_invested,current_value,pnl,reference_id)
+       VALUES($1,$2,$3,$4,'buy',$5,$6,$6,$7,$7,0,$8) RETURNING *`,
+      [req.user.id, asset_id, a.symbol, a.name, qty, a.current_price, amount, refId]
+    );
+    await pool.query('UPDATE users SET balance=balance-$1 WHERE id=$2', [amount, req.user.id]);
+    const txRefId = require('../utils/helpers').generateReferenceId();
+    await pool.query(
+      `INSERT INTO transactions(user_id,type,amount,currency,status,reference_id,description) VALUES($1,'debit',$2,$3,'completed',$4,$5)`,
+      [req.user.id, amount, req.user.preferred_currency||'USD', txRefId, `Bought ${qty.toFixed(6)} ${a.symbol}`]
+    );
+    await pool.query(`INSERT INTO notifications(user_id,type,title,message) VALUES($1,'success','Trade Executed 📈',$2)`,
+      [req.user.id, `You bought ${qty.toFixed(6)} ${a.symbol} (${a.name}) for $${parseFloat(amount).toLocaleString()}`]);
+    await require('../config/ntfy').send('📈 New Trade', `${req.user.first_name} ${req.user.last_name} bought $${amount} of ${a.name}`, 'default');
+    res.json({ success: true, trade: trade.rows[0] });
+  } catch(e) { console.error(e); res.status(500).json({ error: 'Failed' }); }
+});
+
+// Get trade history
+router.get('/trading/history', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT t.*, a.icon, a.color FROM user_trades t
+      JOIN trading_assets a ON t.asset_id=a.id
+      WHERE t.user_id=$1 ORDER BY t.created_at DESC LIMIT 50
+    `, [req.user.id]);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// Sell asset
+router.post('/trading/sell/:tradeId', authMiddleware, async (req, res) => {
+  try {
+    const trade = await pool.query('SELECT t.*,a.current_price as market_price FROM user_trades t JOIN trading_assets a ON t.asset_id=a.id WHERE t.id=$1 AND t.user_id=$2', [req.params.tradeId, req.user.id]);
+    if (!trade.rows[0]) return res.status(404).json({ error: 'Trade not found' });
+    const t = trade.rows[0];
+    const sellValue = t.admin_pnl_override !== null ? parseFloat(t.amount_invested) + parseFloat(t.admin_pnl_override) : parseFloat(t.current_value);
+    await pool.query("UPDATE user_trades SET status='closed',current_value=$1,pnl=$2,updated_at=NOW() WHERE id=$3",
+      [sellValue, sellValue - parseFloat(t.amount_invested), t.id]);
+    await pool.query('UPDATE users SET balance=balance+$1 WHERE id=$2', [sellValue, req.user.id]);
+    const refId = require('../utils/helpers').generateReferenceId();
+    await pool.query(`INSERT INTO transactions(user_id,type,amount,currency,status,reference_id,description) VALUES($1,'credit',$2,$3,'completed',$4,$5)`,
+      [req.user.id, sellValue, req.user.preferred_currency||'USD', refId, `Sold ${t.asset_symbol} position`]);
+    res.json({ success: true, sold_for: sellValue, pnl: sellValue - parseFloat(t.amount_invested) });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});

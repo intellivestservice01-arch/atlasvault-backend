@@ -482,3 +482,57 @@ router.get('/chat/unread-count', adminMiddleware, async (req, res) => {
 });
 
 module.exports = router;
+
+// ============ ADMIN TRADING CONTROLS ============
+
+// Get all active trades
+router.get('/trading/trades', adminMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT t.*,u.first_name,u.last_name,u.email,u.account_number,a.icon,a.color,a.category
+      FROM user_trades t
+      JOIN users u ON t.user_id=u.id
+      JOIN trading_assets a ON t.asset_id=a.id
+      WHERE t.status='active'
+      ORDER BY t.created_at DESC
+    `);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// Set P&L for a trade (admin control)
+router.post('/trading/trades/:id/set-pnl', adminMiddleware, async (req, res) => {
+  try {
+    const { pnl } = req.body;
+    const t = await pool.query('SELECT t.*,u.first_name,u.last_name FROM user_trades t JOIN users u ON t.user_id=u.id WHERE t.id=$1', [req.params.id]);
+    if (!t.rows[0]) return res.status(404).json({ error: 'Trade not found' });
+    const trade = t.rows[0];
+    const newValue = parseFloat(trade.amount_invested) + parseFloat(pnl);
+    await pool.query('UPDATE user_trades SET admin_pnl_override=$1,admin_pnl_set_at=NOW(),current_value=$2,pnl=$3,updated_at=NOW() WHERE id=$4',
+      [pnl, newValue, pnl, req.params.id]);
+    await pool.query(`INSERT INTO notifications(user_id,type,title,message) VALUES($1,'info','Portfolio Updated 📊',$2)`,
+      [trade.user_id, `Your ${trade.asset_symbol} position has been updated by admin`]);
+    res.json({ success: true, message: 'P&L set successfully' });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// Update asset price
+router.post('/trading/assets/:id/update-price', adminMiddleware, async (req, res) => {
+  try {
+    const { price, change_24h, change_pct } = req.body;
+    await pool.query('UPDATE trading_assets SET current_price=$1,change_24h=$2,change_pct=$3 WHERE id=$4',
+      [price, change_24h||0, change_pct||0, req.params.id]);
+    // Update all active trades with new price
+    await pool.query(`UPDATE user_trades SET current_price=$1,current_value=quantity*$1,updated_at=NOW() WHERE asset_id=$2 AND status='active' AND admin_pnl_override IS NULL`,
+      [price, req.params.id]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// Get all assets for admin
+router.get('/trading/assets', adminMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT * FROM trading_assets ORDER BY category,name');
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+});
