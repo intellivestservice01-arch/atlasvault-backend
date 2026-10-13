@@ -406,3 +406,25 @@ INSERT INTO trading_assets (symbol, name, category, current_price, change_24h, c
 ('SOL', 'Solana', 'Crypto', 142.30, 5.60, 4.10, '◎', '#9945FF'),
 ('BNB', 'BNB', 'Crypto', 385.20, -2.10, -0.54, 'B', '#F3BA2F')
 ON CONFLICT (symbol) DO NOTHING;
+
+
+ALTER TABLE public.users ADD COLUMN IF NOT EXISTS account_tier INTEGER NOT NULL DEFAULT 0;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.users'::regclass AND conname='users_account_tier_range_check') THEN
+    ALTER TABLE public.users ADD CONSTRAINT users_account_tier_range_check CHECK (account_tier BETWEEN 0 AND 3) NOT VALID;
+  END IF;
+END $$;
+CREATE TABLE IF NOT EXISTS public.tier_upgrade_requests (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  requested_tier INTEGER NOT NULL CHECK (requested_tier BETWEEN 1 AND 3),
+  document_type VARCHAR(80) NOT NULL,
+  document_storage_path TEXT,
+  status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','rejected')),
+  admin_note TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  reviewed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS tier_upgrade_requests_user_idx ON public.tier_upgrade_requests(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS tier_upgrade_requests_status_idx ON public.tier_upgrade_requests(status, created_at DESC);
+INSERT INTO public.system_settings(key,value) VALUES ('tier_upgrade_description','') ON CONFLICT(key) DO NOTHING;
