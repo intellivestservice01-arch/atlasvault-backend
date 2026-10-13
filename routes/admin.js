@@ -73,22 +73,21 @@ router.post('/verify-2fa', async (req, res) => {
 // DASHBOARD
 router.get('/dashboard', adminMiddleware, async (req, res) => {
   try {
-    const [users, deps, wdws, kyc, loans, irs, tickets, inv, pendDep, pendWdw] = await Promise.all([
+    const [users, deps, wdws, kyc, loans, irs, tickets, pendDep, pendWdw] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM users'),
       pool.query("SELECT COUNT(*),COALESCE(SUM(amount),0) as total FROM deposits WHERE status='approved'"),
       pool.query("SELECT COUNT(*),COALESCE(SUM(amount),0) as total FROM withdrawals WHERE status='approved'"),
-      pool.query("SELECT COUNT(*) FROM kyc_verifications WHERE status='pending'"),
+      pool.query("SELECT COUNT(*) FROM tier_upgrade_requests WHERE status='pending'"),
       pool.query("SELECT COUNT(*) FROM loans WHERE status='pending'"),
       pool.query("SELECT COUNT(*) FROM irs_requests WHERE status='pending'"),
       pool.query("SELECT COUNT(*) FROM support_tickets WHERE status='open'"),
-      pool.query("SELECT COUNT(*) FROM investments WHERE status='active'"),
       pool.query("SELECT COUNT(*) FROM deposits WHERE status='pending'"),
       pool.query("SELECT COUNT(*) FROM withdrawals WHERE status='pending'"),
     ]);
     const recentUsers = await pool.query('SELECT id,first_name,last_name,email,account_number,kyc_status,balance,currency,created_at FROM users ORDER BY created_at DESC LIMIT 10');
     const recentTxns = await pool.query('SELECT t.*,u.first_name,u.last_name FROM transactions t JOIN users u ON t.user_id=u.id ORDER BY t.created_at DESC LIMIT 10');
     res.json({
-      stats: { total_users: parseInt(users.rows[0].count), total_deposits: parseFloat(deps.rows[0].total), total_withdrawals: parseFloat(wdws.rows[0].total), pending_kyc: parseInt(kyc.rows[0].count), pending_loans: parseInt(loans.rows[0].count), pending_irs: parseInt(irs.rows[0].count), open_tickets: parseInt(tickets.rows[0].count), active_investments: parseInt(inv.rows[0].count), pending_deposits: parseInt(pendDep.rows[0].count), pending_withdrawals: parseInt(pendWdw.rows[0].count) },
+      stats: { total_users: parseInt(users.rows[0].count), total_deposits: parseFloat(deps.rows[0].total), total_withdrawals: parseFloat(wdws.rows[0].total), pending_kyc: parseInt(kyc.rows[0].count), pending_loans: parseInt(loans.rows[0].count), pending_irs: parseInt(irs.rows[0].count), open_tickets: parseInt(tickets.rows[0].count), pending_deposits: parseInt(pendDep.rows[0].count), pending_withdrawals: parseInt(pendWdw.rows[0].count) },
       recent_users: recentUsers.rows,
       recent_transactions: recentTxns.rows,
     });
@@ -278,16 +277,6 @@ router.put('/loans/:id/reject', adminMiddleware, async (req, res) => {
   catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
-// INVESTMENTS
-router.get('/investments', adminMiddleware, async (req, res) => {
-  try { res.json((await pool.query('SELECT i.*,p.name as plan_name,u.first_name,u.last_name,u.email FROM investments i JOIN investment_plans p ON i.plan_id=p.id JOIN users u ON i.user_id=u.id ORDER BY i.created_at DESC')).rows); }
-  catch (e) { res.status(500).json({ error: 'Failed' }); }
-});
-router.put('/investment-plans/:id', adminMiddleware, async (req, res) => {
-  try { const { minimum_amount, return_amount, duration_days, is_active } = req.body; await pool.query('UPDATE investment_plans SET minimum_amount=$1,return_amount=$2,duration_days=$3,is_active=$4 WHERE id=$5', [minimum_amount, return_amount, duration_days, is_active, req.params.id]); res.json({ message: 'Plan updated' }); }
-  catch (e) { res.status(500).json({ error: 'Failed' }); }
-});
-
 // CARDS
 router.get('/cards', adminMiddleware, async (req, res) => {
   try { res.json((await pool.query('SELECT c.*,u.first_name,u.last_name,u.email FROM virtual_cards c JOIN users u ON c.user_id=u.id ORDER BY c.created_at DESC')).rows); }
@@ -370,7 +359,6 @@ const genCodeRoute = (field, label) => async (req, res) => {
 router.post('/chat/:userId/gen-exchange-fee', adminMiddleware, genCodeRoute('exchange_fee_code', 'Exchange Fee'));
 router.post('/chat/:userId/gen-withdrawal-fee', adminMiddleware, genCodeRoute('withdrawal_fee_code', 'Withdrawal Fee'));
 router.post('/chat/:userId/gen-vat', adminMiddleware, genCodeRoute('vat_code', 'VAT'));
-router.post('/chat/:userId/gen-imf', adminMiddleware, genCodeRoute('imf_code', 'IMF'));
 
 // SUPPORT CHAT
 router.get('/support/users', adminMiddleware, async (req, res) => {
@@ -429,12 +417,11 @@ router.get('/transactions', adminMiddleware, async (req, res) => {
 // SYSTEM MONITOR
 router.get('/system-monitor', adminMiddleware, async (req, res) => {
   try {
-    const [users, txns, deps, wdws, inv, pendDep, pendWdw, tables] = await Promise.all([
+    const [users, txns, deps, wdws, pendDep, pendWdw, tables] = await Promise.all([
       pool.query('SELECT COUNT(*) FROM users'),
       pool.query('SELECT COUNT(*) FROM transactions'),
       pool.query("SELECT COUNT(*),COALESCE(SUM(amount),0) as total FROM deposits WHERE status='approved'"),
       pool.query("SELECT COUNT(*),COALESCE(SUM(amount),0) as total FROM withdrawals WHERE status='approved'"),
-      pool.query("SELECT COUNT(*) FROM investments WHERE status='active'"),
       pool.query("SELECT COUNT(*) FROM deposits WHERE status='pending'"),
       pool.query("SELECT COUNT(*) FROM withdrawals WHERE status='pending'"),
       pool.query("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'"),
@@ -445,7 +432,6 @@ router.get('/system-monitor', adminMiddleware, async (req, res) => {
       transactions: { total: parseInt(txns.rows[0].count) },
       deposits: { total: parseInt(deps.rows[0].count), amount: parseFloat(deps.rows[0].total), pending: parseInt(pendDep.rows[0].count) },
       withdrawals: { total: parseInt(wdws.rows[0].count), amount: parseFloat(wdws.rows[0].total), pending: parseInt(pendWdw.rows[0].count) },
-      investments: { active: parseInt(inv.rows[0].count) },
       server: { uptime: process.uptime(), memory: process.memoryUsage(), node_version: process.version, environment: process.env.NODE_ENV },
     });
   } catch (e) { console.error(e); res.status(500).json({ error: 'Failed' }); }
@@ -481,58 +467,28 @@ router.get('/chat/unread-count', adminMiddleware, async (req, res) => {
   } catch(e) { res.status(500).json({ error: 'Failed' }); }
 });
 
+// ===== ACCOUNT TIER UPGRADE SETTINGS AND REVIEW =====
+router.get('/tier-upgrade-description', adminMiddleware, async (req, res) => {
+  try { const r = await pool.query("SELECT value FROM system_settings WHERE key='tier_upgrade_description'"); res.json({ description: r.rows[0]?.value || '' }); }
+  catch (e) { res.status(500).json({ error: 'Could not load setting' }); }
+});
+router.put('/tier-upgrade-description', adminMiddleware, async (req, res) => {
+  try { const description = String(req.body.description || '').slice(0, 4000); await pool.query("INSERT INTO system_settings(key,value,updated_at) VALUES('tier_upgrade_description',$1,NOW()) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()", [description]); res.json({ message: 'Upgrade information saved', description }); }
+  catch (e) { res.status(500).json({ error: 'Could not save setting' }); }
+});
+router.get('/tier-upgrade-requests', adminMiddleware, async (req, res) => {
+  try { const r = await pool.query('SELECT q.*,u.first_name,u.last_name,u.email,u.account_number FROM tier_upgrade_requests q JOIN users u ON u.id=q.user_id ORDER BY q.created_at DESC'); const storage=require('../config/storage').supabase; const rows=await Promise.all(r.rows.map(async row=>{ if(row.document_storage_path){ const signed=await storage.storage.from('atlasvault-tier-documents').createSignedUrl(row.document_storage_path, 300); row.document_url=signed.data?.signedUrl||null; } return row; })); res.json(rows); }
+  catch (e) { console.error(e.message); res.status(500).json({ error: 'Could not load tier requests' }); }
+});
+router.put('/tier-upgrade-requests/:id/decision', adminMiddleware, async (req, res) => {
+  const { decision, note } = req.body; if (!['approved','rejected'].includes(decision)) return res.status(400).json({ error: 'Decision must be approved or rejected' });
+  const client = await pool.connect();
+  try { await client.query('BEGIN'); const q = await client.query("SELECT * FROM tier_upgrade_requests WHERE id=$1 AND status='pending' FOR UPDATE", [req.params.id]); if (!q.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Pending request not found' }); }
+    const request = q.rows[0]; await client.query('UPDATE tier_upgrade_requests SET status=$1,admin_note=$2,reviewed_at=NOW() WHERE id=$3', [decision, String(note||'').slice(0,1000), request.id]);
+    if (decision === 'approved') await client.query('UPDATE users SET account_tier=GREATEST(COALESCE(account_tier,0),$1), kyc_status=$2 WHERE id=$3', [request.requested_tier, 'verified', request.user_id]);
+    await client.query('INSERT INTO notifications(user_id,type,title,message) VALUES($1,$2,$3,$4)', [request.user_id, decision==='approved'?'success':'error', decision==='approved'?'Account Tier Approved':'Account Tier Request Rejected', decision==='approved'?`Your account tier ${request.requested_tier} has been approved.`:`Your tier upgrade request was rejected. ${String(note||'Please contact support.').slice(0,500)}`]);
+    await client.query('COMMIT'); res.json({ message: `Tier request ${decision}` });
+  } catch(e) { await client.query('ROLLBACK'); console.error(e.message); res.status(500).json({ error: 'Could not update tier request' }); } finally { client.release(); }
+});
+
 module.exports = router;
-
-// ============ ADMIN TRADING CONTROLS ============
-
-// Get all active trades
-router.get('/trading/trades', adminMiddleware, async (req, res) => {
-  try {
-    const r = await pool.query(`
-      SELECT t.*,u.first_name,u.last_name,u.email,u.account_number,a.icon,a.color,a.category
-      FROM user_trades t
-      JOIN users u ON t.user_id=u.id
-      JOIN trading_assets a ON t.asset_id=a.id
-      WHERE t.status='active'
-      ORDER BY t.created_at DESC
-    `);
-    res.json(r.rows);
-  } catch(e) { res.status(500).json({ error: 'Failed' }); }
-});
-
-// Set P&L for a trade (admin control)
-router.post('/trading/trades/:id/set-pnl', adminMiddleware, async (req, res) => {
-  try {
-    const { pnl } = req.body;
-    const t = await pool.query('SELECT t.*,u.first_name,u.last_name FROM user_trades t JOIN users u ON t.user_id=u.id WHERE t.id=$1', [req.params.id]);
-    if (!t.rows[0]) return res.status(404).json({ error: 'Trade not found' });
-    const trade = t.rows[0];
-    const newValue = parseFloat(trade.amount_invested) + parseFloat(pnl);
-    await pool.query('UPDATE user_trades SET admin_pnl_override=$1,admin_pnl_set_at=NOW(),current_value=$2,pnl=$3,updated_at=NOW() WHERE id=$4',
-      [pnl, newValue, pnl, req.params.id]);
-    await pool.query(`INSERT INTO notifications(user_id,type,title,message) VALUES($1,'info','Portfolio Updated 📊',$2)`,
-      [trade.user_id, `Your ${trade.asset_symbol} position has been updated by admin`]);
-    res.json({ success: true, message: 'P&L set successfully' });
-  } catch(e) { res.status(500).json({ error: 'Failed' }); }
-});
-
-// Update asset price
-router.post('/trading/assets/:id/update-price', adminMiddleware, async (req, res) => {
-  try {
-    const { price, change_24h, change_pct } = req.body;
-    await pool.query('UPDATE trading_assets SET current_price=$1,change_24h=$2,change_pct=$3 WHERE id=$4',
-      [price, change_24h||0, change_pct||0, req.params.id]);
-    // Update all active trades with new price
-    await pool.query(`UPDATE user_trades SET current_price=$1,current_value=quantity*$1,updated_at=NOW() WHERE asset_id=$2 AND status='active' AND admin_pnl_override IS NULL`,
-      [price, req.params.id]);
-    res.json({ success: true });
-  } catch(e) { res.status(500).json({ error: 'Failed' }); }
-});
-
-// Get all assets for admin
-router.get('/trading/assets', adminMiddleware, async (req, res) => {
-  try {
-    const r = await pool.query('SELECT * FROM trading_assets ORDER BY category,name');
-    res.json(r.rows);
-  } catch(e) { res.status(500).json({ error: 'Failed' }); }
-});
